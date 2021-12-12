@@ -17,7 +17,8 @@ SAMPLE_TIME = 300
 #Ise-IDs can be listed with the command http://<Homematic IP>/addons/xmlapi/sysvarlist.cgi
 HMISEIDS = ["26084,26085,26086,26087,26088,26089,26090,26091,26092,26093,26094," \
             "26095,26096,26097,26098,26099,26100,26101,26102,26103,26104,26105,26106",
-            "20765,20766,20767,20768,20769,25817,25818,25821,25822,25819,25820"]
+            "26411,26412,26413,26414,26415,26416,26417,26418,26419,26420,26421," \
+            "26422,26423,26424,26425,26426,26427,26428,26429,26430,26431,26432,26433"]
 
 def umwandeln_ieee(Wert):  #Umwandlung Array of int ( 4 byte) in float nach IEEE 754
 
@@ -148,7 +149,7 @@ def read_from_meter(meternr):
     using write_to_homematic
     """
 
-    smartmeter = minimalmodbus.Instrument('/dev/ttyUSB1', meternr, mode='rtu',
+    smartmeter = minimalmodbus.Instrument('/dev/ORNO', meternr, mode='rtu',
                                           close_port_after_each_call=True, debug=False)
 
     smartmeter.serial.baudrate = 9600 # Baud
@@ -433,5 +434,5 @@ def read_from_meter(meternr):
 
 hmstring=read_from_meter(1)
 write_to_homematic(1, hmstring)
-#hmstring=read_from_meter(2)
-#write_to_homematic(2, hmstring)
+hmstring=read_from_meter(2)
+write_to_homematic(2, hmstring)
