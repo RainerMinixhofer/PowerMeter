@@ -1,4 +1,3 @@
-#!/usr/bin/python3
 """
 Routine for reading Modbus registers from Orno OR-WE-517 Energy Meter
 """
