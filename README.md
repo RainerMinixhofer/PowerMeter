@@ -30,3 +30,9 @@ has been created which is the default port the script is accessing.
 Alternatively to a reboot one can issue
 
 > sudo udevadm control --reload-rules && sudo udevadm trigger
+
+According to [this forum](https://forum.ubuntuusers.de/topic/problem-mit-usb-seriell-wandler-geloest/) if the rule does not work one needs to uninstall the Braille tty driver with
+
+> sudo apt remove brltty
+
+then the named port ORNO should be linked correctly to a ttyUSBx port.
