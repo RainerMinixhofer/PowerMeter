@@ -10,7 +10,7 @@ To generate a unique device id for the USB port of the RS-485 to USB converter w
 
 enter the following line into the editor
 
-> SUBSYSTEM=="usb", ATTRS{idVendor}=="0403", ATTRS{idProduct}=="6001", SYMLINK+="ORNO", MODE="0666"
+> SUBSYSTEM=="tty", ATTRS{idVendor}=="0403", ATTRS{idProduct}=="6001", SYMLINK+="ORNO", MODE="0666"
 
 where the vendor id and the product id are the ones of the above mentioned converter. If you use a different product you'll need to inspect the output of
 
@@ -30,3 +30,9 @@ has been created which is the default port the script is accessing.
 Alternatively to a reboot one can issue
 
 > sudo udevadm control --reload-rules && sudo udevadm trigger
+
+According to [this forum](https://forum.ubuntuusers.de/topic/problem-mit-usb-seriell-wandler-geloest/) if the rule does not work one needs to uninstall the Braille tty driver with
+
+> sudo apt remove brltty
+
+then the named port ORNO should be linked correctly to a ttyUSBx port.
