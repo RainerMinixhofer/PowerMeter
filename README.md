@@ -26,3 +26,7 @@ After reboot the new symlink
 > /dev/ORNO
 
 has been created which is the default port the script is accessing.
+
+Alternatively to a reboot one can issue
+
+> sudo udevadm control --reload-rules && sudo udevadm trigger
