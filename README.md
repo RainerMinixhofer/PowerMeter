@@ -10,7 +10,7 @@ To generate a unique device id for the USB port of the RS-485 to USB converter w
 
 enter the following line into the editor
 
-> SUBSYSTEM=="tty", ATTRS{idVendor}=="0403", ATTRS{idProduct}=="6001", SYMLINK+="ORNO", MODE="0666"
+> SUBSYSTEM=="usb", ATTRS{idVendor}=="0403", ATTRS{idProduct}=="6001", SYMLINK+="ORNO", MODE="0666"
 
 where the vendor id and the product id are the ones of the above mentioned converter. If you use a different product you'll need to inspect the output of
 
