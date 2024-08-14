@@ -10,7 +10,7 @@ import urllib3 #pylint: disable=E0401
 import minimalmodbus #pylint: disable=E0401
 
 DEBUG = False
-URL = "http://homematic.minix.local"
+URL = "http://homematic.ps.minixhofer.com"
 SAMPLE_TIME = 300
 #Definition of ISEIDs for writing to homematic
 #Ise-IDs can be listed with the command http://<Homematic IP>/addons/xmlapi/sysvarlist.cgi
