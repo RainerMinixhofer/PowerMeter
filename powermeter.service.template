@@ -1,0 +1,9 @@
+[Unit]
+Description=Read Powermeters in PowerCabinet
+After=multi-user.target
+[Service]
+Type=simple
+Restart=always
+ExecStart=python /home/rainer/Projects/PowerMeter/read_or-we-517.py
+[Install]
+WantedBy=multi-user.target
