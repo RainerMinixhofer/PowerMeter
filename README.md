@@ -37,6 +37,10 @@ According to [this forum](https://forum.ubuntuusers.de/topic/problem-mit-usb-ser
 
 then the named port ORNO should be linked correctly to a ttyUSBx port.
 
+To run this python script successfully the pymodbus package needs to be installed with
+
+> sudo apt install python3-pymodbus
+
 ## Run script as service
 
 Copy provided systemd service file 'powermeter.service.template' to systemd service file folder
@@ -46,9 +50,7 @@ Copy provided systemd service file 'powermeter.service.template' to systemd serv
 Enable and start service with
 
 > sudo systemctl daemon-reload
-> 
 > sudo systemctl enable powermeter.service
->
 > sudo systemctl start powermeter.service
 
 Check successful activation with

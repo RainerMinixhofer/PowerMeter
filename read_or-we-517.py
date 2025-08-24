@@ -2,12 +2,10 @@
 Routine for reading Modbus registers from Orno OR-WE-517 Energy Meter
 """
 
-#pylint: disable=C0103,R0912,R0914,R0915
-
 import struct
 import binascii
-import urllib3 #pylint: disable=E0401
-import minimalmodbus #pylint: disable=E0401
+import urllib3
+from pymodbus.client import ModbusSerialClient
 
 DEBUG = False
 URL = "http://homematic.ps.minixhofer.com"
@@ -82,9 +80,14 @@ def read_reg(smartmeter, reg):
     handling
     """
     try:
-        return smartmeter.read_register(reg, 0, 3, False)
-    except IOError:
-        print("Read error reading register ", reg, "retry in next time interval")
+        # pymodbus: read 1 register (2 bytes)
+        result = smartmeter.read_holding_registers(reg, 1, unit=smartmeter.unit)
+        if result.isError():
+            print("Read error reading register ", reg, "retry in next time interval")
+            return 0
+        return result.registers[0]
+    except Exception as e:
+        print("Read error reading register ", reg, e, "retry in next time interval")
         return 0
 
 def read_long(smartmeter, reg):
@@ -105,9 +108,15 @@ def read_long(smartmeter, reg):
     handling
     """
     try:
-        return smartmeter.read_long(reg, 3, False, 0)
-    except IOError:
-        print("Read error reading register ", reg, "retry in next time interval")
+        # pymodbus: read 2 registers (4 bytes)
+        result = smartmeter.read_holding_registers(reg, 2, unit=smartmeter.unit)
+        if result.isError():
+            print("Read error reading register ", reg, "retry in next time interval")
+            return 0
+        # Combine two 16-bit registers into a 32-bit integer (big-endian)
+        return (result.registers[0] << 16) + result.registers[1]
+    except Exception as e:
+        print("Read error reading register ", reg, e, "retry in next time interval")
         return 0
 
 def read_float(smartmeter, reg, fractdig):
@@ -131,9 +140,16 @@ def read_float(smartmeter, reg, fractdig):
     handling and conversion into ieee float
     """
     try:
-        return round(umwandeln_ieee(smartmeter.read_long(reg, 3, False, 0)), fractdig)
-    except IOError:
-        print("Read error reading register ", reg, "retry in next time interval")
+        # pymodbus: read 2 registers (4 bytes)
+        result = smartmeter.read_holding_registers(reg, 2, unit=smartmeter.unit)
+        if result.isError():
+            print("Read error reading register ", reg, "retry in next time interval")
+            return 0
+        # Combine two 16-bit registers into a 32-bit int, then convert to float
+        value = (result.registers[0] << 16) + result.registers[1]
+        return round(umwandeln_ieee(value), fractdig)
+    except Exception as e:
+        print("Read error reading register ", reg, e, "retry in next time interval")
         return 0
 
 def read_from_meter(meternr):
@@ -148,18 +164,19 @@ def read_from_meter(meternr):
     using write_to_homematic
     """
 
-    smartmeter = minimalmodbus.Instrument('/dev/ORNO', meternr, mode='rtu',
-                                          close_port_after_each_call=True, debug=False)
 
-    smartmeter.serial.baudrate = 9600 # Baud
-    smartmeter.serial.bytesize = 8
-    smartmeter.serial.parity   = minimalmodbus.serial.PARITY_EVEN # vendor default is EVEN
-    smartmeter.serial.stopbits = 1
-    smartmeter.serial.timeout  = 0.6  # seconds
-
-    smartmeter.clear_buffers_before_each_transaction = True
-
-    smartmeter.debug = False # set to "True" for debug mode
+    # Initialize pymodbus client
+    smartmeter = ModbusSerialClient(
+        method='rtu',
+        port='/dev/ORNO',
+        baudrate=9600,
+        bytesize=8,
+        parity='E',
+        stopbits=1,
+        timeout=0.6
+    )
+    smartmeter.connect()
+    smartmeter.unit = meternr
 
     #Adresse = smartmeter.read_register(2, 0, 3, False)
     # registeraddress, number_of_decimals=0, functioncode=3, signed=False
@@ -409,7 +426,7 @@ def read_from_meter(meternr):
     if DEBUG:
         print("L3 Reverse Reactive Energy:", L3ReverseReactiveEnergy, " kVarh")
 
-    smartmeter.serial.close()
+    smartmeter.close()
 
     hmdata = ('%(L1V).1f,%(L2V).1f,%(L3V).1f,%(f).2f,%(L1I).2f,%(L2I).2f,%(L3I).2f,'
               '%(TAP)d,%(L1AP)d,%(L2AP)d,%(L3AP)d,'
