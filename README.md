@@ -36,3 +36,20 @@ According to [this forum](https://forum.ubuntuusers.de/topic/problem-mit-usb-ser
 > sudo apt remove brltty
 
 then the named port ORNO should be linked correctly to a ttyUSBx port.
+
+## Run script as service
+
+Copy provided systemd service file 'powermeter.service.template' to systemd service file folder
+
+> sudo cp powermeter.service.template /lib/systemd/system/powermeter.service
+
+Enable and start service with
+
+> sudo systemctl daemon-reload
+> sudo systemctl enable powermeter.service
+> sudo systemctl start powermeter.service
+
+Check successful activation with
+
+> sudo systemctl status powermeter.service
+
