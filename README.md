@@ -46,7 +46,9 @@ Copy provided systemd service file 'powermeter.service.template' to systemd serv
 Enable and start service with
 
 > sudo systemctl daemon-reload
+> 
 > sudo systemctl enable powermeter.service
+>
 > sudo systemctl start powermeter.service
 
 Check successful activation with
