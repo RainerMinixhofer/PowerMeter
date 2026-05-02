@@ -37,9 +37,36 @@ According to [this forum](https://forum.ubuntuusers.de/topic/problem-mit-usb-ser
 
 then the named port ORNO should be linked correctly to a ttyUSBx port.
 
-To run this python script successfully the pymodbus package needs to be installed with
+To run this python script successfully, create a Python virtual environment in the project folder and install the required packages:
 
-> sudo apt install python3-pymodbus
+> cd /home/rainer/Projects/PowerMeter
+>
+> python3 -m venv .venv
+>
+> .venv/bin/pip install pymodbus paho-mqtt pyserial
+
+The `.venv` folder is excluded from git via `.gitignore`.
+
+MQTT broker settings are configured in `mqtt_credentials.py` (not tracked by git).
+
+Create this local file from the provided template:
+
+> cp mqtt_credentials.template.py mqtt_credentials.py
+
+Then edit `mqtt_credentials.py` and set:
+
+- MQTT_USERNAME
+- MQTT_PASSWORD
+- MQTT_HOST — hostname or IP address of your MQTT broker
+
+The file `mqtt_credentials.py` is ignored by git via `.gitignore`.
+
+Published topics follow this format (meter names are configured in `METER_TOPICS` inside `read_or-we-517.py`):
+
+- powermeter/Household/\<metric\>
+- powermeter/Heatpump/\<metric\>
+- powermeter/Household/json
+- powermeter/Heatpump/json
 
 ## Run script as service
 

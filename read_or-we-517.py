@@ -1,66 +1,169 @@
+#pylint: disable=C0103
 """
 Routine for reading Modbus registers from Orno OR-WE-517 Energy Meter
 """
 
-import struct
-import binascii
-import urllib3
-from pymodbus.client import ModbusSerialClient
+import struct                             # for IEEE 754 float conversion
+import json                              # for JSON MQTT payload
+import paho.mqtt.client as mqtt          # MQTT client
+from pymodbus.client import ModbusSerialClient  # RS-485/Modbus over serial
 
+try:
+    from mqtt_credentials import MQTT_USERNAME, MQTT_PASSWORD, MQTT_HOST
+except ImportError as exc:
+    raise RuntimeError(
+        "Missing mqtt_credentials.py. Copy mqtt_credentials.template.py to "
+        "mqtt_credentials.py and set your MQTT credentials."
+    ) from exc
+
+# Set DEBUG = True to print every register value to stdout during a run.
 DEBUG = False
-URL = "http://homematic.ps.minixhofer.com"
-SAMPLE_TIME = 300
-#Definition of ISEIDs for writing to homematic
-#Ise-IDs can be listed with the command http://<Homematic IP>/addons/xmlapi/sysvarlist.cgi
-HMISEIDS = ["26084,26085,26086,26087,26088,26089,26090,26091,26092,26093,26094," \
-            "26095,26096,26097,26098,26099,26100,26101,26102,26103,26104,26105,26106",
-            "26411,26412,26413,26414,26415,26416,26417,26418,26419,26420,26421," \
-            "26422,26423,26424,26425,26426,26427,26428,26429,26430,26431,26432,26433"]
+
+# Set BOOTSTRAP_STATES = True for a single run to publish default (zero) values
+# for all states so the ioBroker MQTT adapter auto-creates the object tree.
+# Switch back to False for normal operation to avoid publishing spurious zeros.
+BOOTSTRAP_STATES = False
+
+# --- MQTT broker connection settings ---
+# MQTT_HOST is loaded from mqtt_credentials.py (not tracked by git).
+MQTT_PORT = 1883
+MQTT_TOPIC_PREFIX = "powermeter"  # root of all published topics
+MQTT_QOS = 1       # at-least-once delivery
+MQTT_RETAIN = True  # broker retains last value so ioBroker sees it after restart
+SAMPLE_TIME = 300   # intended polling interval in seconds (used externally, e.g. cron/systemd)
+
+# Maps Modbus device address -> MQTT sub-topic name.
+# Add further meters here if needed.
+METER_TOPICS = {
+    1: "Household",
+    2: "Heatpump",
+}
+
+# Default payload used by bootstrap_mqtt_states() to seed the ioBroker object tree.
+# All values are zero; keys match exactly the keys published during normal operation.
+DEFAULT_METER_DATA = {
+    "L1-Voltage (V)": 0,
+    "L2-Voltage (V)": 0,
+    "L3-Voltage (V)": 0,
+    "Grid Frequency (Hz)": 0,
+    "L1-Current (A)": 0,
+    "L2-Current (A)": 0,
+    "L3-Current (A)": 0,
+    "Total Active Power (kW)": 0,
+    "L1-Active Power (kW)": 0,
+    "L2-Active Power (kW)": 0,
+    "L3-Active Power (kW)": 0,
+    "Total Reactive Power (kVar)": 0,
+    "L1-Reactive Power (kVar)": 0,
+    "L2-Reactive Power (kVar)": 0,
+    "L3-Reactive Power (kVar)": 0,
+    "Total Apparent Power (kVA)": 0,
+    "L1-Apparent Power (kVA)": 0,
+    "L2-Apparent Power (kVA)": 0,
+    "L3-Apparent Power (kVA)": 0,
+    "Total Power Faktor": 0,
+    "L1-Power Factor": 0,
+    "L2-Power Factor": 0,
+    "L3-Power Factor": 0,
+}
+
+
+def read_holding_registers_compat(smartmeter, reg, count):
+    """
+    Read holding registers with API compatibility across pymodbus versions.
+
+    Depending on version, the client may expect one of `device_id`, `slave`
+    or `unit`, and may require keyword-only arguments for `count`.
+    """
+    # Try all known calling conventions in order from newest to oldest pymodbus.
+    # The first one that does not raise TypeError is used for every subsequent call.
+    attempts = [
+        lambda: smartmeter.read_holding_registers(
+            address=reg, count=count, device_id=smartmeter.unit
+        ),
+        lambda: smartmeter.read_holding_registers(
+            address=reg, count=count, slave=smartmeter.unit
+        ),
+        lambda: smartmeter.read_holding_registers(
+            address=reg, count=count, unit=smartmeter.unit
+        ),
+        lambda: smartmeter.read_holding_registers(reg, count, slave=smartmeter.unit),
+        lambda: smartmeter.read_holding_registers(reg, count, unit=smartmeter.unit),
+    ]
+
+    last_type_error = None
+    for attempt in attempts:
+        try:
+            return attempt()
+        except TypeError as exc:
+            last_type_error = exc  # keep going, try next variant
+
+    # None of the variants matched; re-raise to surface the real problem.
+    if last_type_error is not None:
+        raise last_type_error
+
+    raise RuntimeError("No compatible pymodbus read_holding_registers signature found")
 
 def umwandeln_ieee(Wert):  #Umwandlung Array of int ( 4 byte) in float nach IEEE 754
 
     """
     Function for conversion of float register values into IEEE value
     """
+    return struct.unpack('>f', struct.pack('>I', Wert))[0]
 
-    Wert2=str(hex(Wert))
-
-    Wert2=Wert2.replace('0x', '')
-
-    if Wert2=='0':
-        Wert2='00000000'
-
-    Wert3=struct.unpack('>f', binascii.unhexlify(Wert2))[0]
-
-    return Wert3
-
-def write_to_homematic(meternr, hmdata):
+def write_to_iobroker(meternr, meter_data, mqtt_client):
     """
-    Writes measurement data from meternr into Homematic using the ISE-IDs
-    specified in HMISEIDS[<meternr>]
+    Writes measurement data from meternr into ioBroker via MQTT.
 
     Parameters
     ----------
     meternr : Integer
         Modbus number of meter to be read
-    hmdata : String
-        String to be written into Homematic with XML-API call
+    meter_data : Dict
+        Dictionary with measurement values
+    mqtt_client : mqtt.Client
+        Connected MQTT client instance
 
     Returns
     -------
     None.
 
     """
-    try:
-        http = urllib3.PoolManager()
-        request = URL + "/config/xmlapi/statechange.cgi?ise_id=" \
-                        + HMISEIDS[meternr-1] + "&new_value=" + hmdata
-        http.request('GET', request)
-        if DEBUG:
-            print('Data written to Raspberrymatic.')
-            print('GET request: ',request)
-    except IOError:
-        print('URLError. Trying again in next time interval.')
+    # Resolve the friendly topic name for this meter (e.g. "Household").
+    # Falls back to "meter<N>" for any unknown meter number.
+    meter_topic = METER_TOPICS.get(meternr, f"meter{meternr}")
+    topic_base = f"{MQTT_TOPIC_PREFIX}/{meter_topic}"
+
+    # Publish each metric as its own retained topic so ioBroker can map
+    # individual states, e.g. powermeter/Household/L1-Voltage (V)
+    for key, value in meter_data.items():
+        topic = f"{topic_base}/{key}"
+        mqtt_client.publish(topic, payload=str(value), qos=MQTT_QOS, retain=MQTT_RETAIN)
+
+    # Also publish a compact JSON payload for consumers that prefer one message.
+    mqtt_client.publish(
+        f"{topic_base}/json",
+        payload=json.dumps(meter_data),
+        qos=MQTT_QOS,
+        retain=MQTT_RETAIN,
+    )
+
+    if DEBUG:
+        print(f"Data written to ioBroker via MQTT topic base: {topic_base}")
+
+
+def bootstrap_mqtt_states(meternr, mqtt_client):
+    """
+    Publish default retained states so ioBroker MQTT adapter can auto-create
+    all expected objects in the MQTT tree.
+
+    Only call this when BOOTSTRAP_STATES is True (once, to seed the tree).
+    Calling it on every run would publish zeros before each real read and
+    cause values in ioBroker to flip between 0 and the measured value.
+    """
+    if DEBUG:
+        print(f"Bootstrapping MQTT states for meter {meternr}...")
+    write_to_iobroker(meternr, DEFAULT_METER_DATA, mqtt_client)
 
 def read_reg(smartmeter, reg):
     """
@@ -81,7 +184,7 @@ def read_reg(smartmeter, reg):
     """
     try:
         # pymodbus: read 1 register (2 bytes)
-        result = smartmeter.read_holding_registers(reg, 1, unit=smartmeter.unit)
+        result = read_holding_registers_compat(smartmeter, reg, 1)
         if result.isError():
             print("Read error reading register ", reg, "retry in next time interval")
             return 0
@@ -109,7 +212,7 @@ def read_long(smartmeter, reg):
     """
     try:
         # pymodbus: read 2 registers (4 bytes)
-        result = smartmeter.read_holding_registers(reg, 2, unit=smartmeter.unit)
+        result = read_holding_registers_compat(smartmeter, reg, 2)
         if result.isError():
             print("Read error reading register ", reg, "retry in next time interval")
             return 0
@@ -141,7 +244,7 @@ def read_float(smartmeter, reg, fractdig):
     """
     try:
         # pymodbus: read 2 registers (4 bytes)
-        result = smartmeter.read_holding_registers(reg, 2, unit=smartmeter.unit)
+        result = read_holding_registers_compat(smartmeter, reg, 2)
         if result.isError():
             print("Read error reading register ", reg, "retry in next time interval")
             return 0
@@ -160,115 +263,117 @@ def read_from_meter(meternr):
         after the instrument has been accessed (faster).
     meternr specifies the Modbus # of the meter
 
-    The routine returns the hmdata string to be written into Homematic
-    using write_to_homematic
+    The routine returns a dictionary with values to be published via MQTT.
     """
 
 
-    # Initialize pymodbus client
+    # Open the RS-485 serial port via the symlink created by the udev rule.
+    # Settings match the OR-WE-517 default: 9600 baud, 8E1.
     smartmeter = ModbusSerialClient(
-        method='rtu',
         port='/dev/ORNO',
         baudrate=9600,
         bytesize=8,
         parity='E',
         stopbits=1,
-        timeout=0.6
+        timeout=0.6   # seconds to wait for a reply before treating it as an error
     )
-    smartmeter.connect()
+    if not smartmeter.connect():
+        raise IOError(f"Failed to connect to meter {meternr} on /dev/ORNO")
+    # Store the Modbus device address on the client so helper functions can read it.
     smartmeter.unit = meternr
 
     #Adresse = smartmeter.read_register(2, 0, 3, False)
     # registeraddress, number_of_decimals=0, functioncode=3, signed=False
 
-    SerialNum = read_long(smartmeter, 0)
+    # --- Device identification registers (reg 0-13) ---
+    SerialNum = read_long(smartmeter, 0)       # 4-byte serial number
     if DEBUG:
         print("Serial number: ",SerialNum)
 
-    ModbusID = read_reg(smartmeter, 2)
+    ModbusID = read_reg(smartmeter, 2)         # Modbus slave address stored on device
     if DEBUG:
         print("Modbus ID: ",ModbusID)
 
-    ModbusBaudrate = read_reg(smartmeter, 3)
+    ModbusBaudrate = read_reg(smartmeter, 3)   # Baud rate code stored on device
     if DEBUG:
         print("Modbus Baudrate: ",ModbusBaudrate, " bps")
 
-    SoftwareVer = read_float(smartmeter, 4, 2)
+    SoftwareVer = read_float(smartmeter, 4, 2) # Firmware version
     if DEBUG:
         print("Software Version: ",SoftwareVer)
 
-    HardwareVer = read_float(smartmeter, 6, 2)
+    HardwareVer = read_float(smartmeter, 6, 2) # Hardware revision
     if DEBUG:
         print("Hardware Version: ",HardwareVer)
 
-    CTRate = read_reg(smartmeter, 8)
+    CTRate = read_reg(smartmeter, 8)           # Current transformer ratio
     if DEBUG:
         print("CT Rate: ",CTRate)
 
-    S0Rate = read_float(smartmeter, 9, 1)
+    S0Rate = read_float(smartmeter, 9, 1)      # S0 pulse output rate (impulses/kWh)
     if DEBUG:
         print("S0 output rate: ",S0Rate," imp/kWh")
 
-    A3Code = read_reg(smartmeter, 11)
+    A3Code = read_reg(smartmeter, 11)          # Tariff/A3 code
     if DEBUG:
         print("A3 Code: ",A3Code)
 
-    HolidayWeekendT = read_reg(smartmeter, 12)
+    HolidayWeekendT = read_reg(smartmeter, 12) # Holiday/weekend tariff flag
     if DEBUG:
         print("Holiday-Weekend T: ", HolidayWeekendT)
 
-    LCDCycleTime = read_reg(smartmeter, 13)
+    LCDCycleTime = read_reg(smartmeter, 13)    # LCD display rotation interval
     if DEBUG:
         print("LCD Cycle Time: ", LCDCycleTime)
 
-    L1Voltage = read_float(smartmeter, 14, 1)
+    # --- Voltage and frequency (reg 14-20) ---
+    L1Voltage = read_float(smartmeter, 14, 1)  # Phase 1 voltage in V
     if DEBUG:
         print("L1-Voltage: ", L1Voltage, " V")
 
-    L2Voltage = read_float(smartmeter, 16, 1)
+    L2Voltage = read_float(smartmeter, 16, 1)  # Phase 2 voltage in V
     if DEBUG:
         print("L2-Voltage: ", L2Voltage, " V")
 
-    L3Voltage = read_float(smartmeter, 18, 1)
+    L3Voltage = read_float(smartmeter, 18, 1)  # Phase 3 voltage in V
     if DEBUG:
         print("L3-Voltage: ", L3Voltage, " V")
 
-    Frequency= read_float(smartmeter, 20, 2)
+    Frequency = read_float(smartmeter, 20, 2)  # Grid frequency in Hz
     if DEBUG:
         print("Grid Frequency: ", Frequency, " Hz")
 
-    L1Current = read_float(smartmeter, 22, 2)
+    # --- Phase currents (reg 22-26) ---
+    L1Current = read_float(smartmeter, 22, 2)  # Phase 1 current in A
     if DEBUG:
         print("L1-Current: ", L1Current, " A")
 
-    L2Current = read_float(smartmeter, 24, 2)
+    L2Current = read_float(smartmeter, 24, 2)  # Phase 2 current in A
     if DEBUG:
         print("L2-Current:", L2Current, " A")
 
-    L3Current = read_float(smartmeter, 26, 2)
+    L3Current = read_float(smartmeter, 26, 2)  # Phase 3 current in A
     if DEBUG:
         print("L3-Current:", L3Current, " A")
 
-    Current_Total = round(L1Current+L2Current+L3Current,3)
-    if DEBUG:
-        print("Current Sum:", Current_Total, " A")
-
+    # --- Active power (reg 28-34), unit kW ---
     TotalActivePower = read_float(smartmeter, 28, 3)
     if DEBUG:
         print("Total Active Power:", TotalActivePower, " kW")
 
-    L1ActivePower= read_float(smartmeter, 30, 3)
+    L1ActivePower = read_float(smartmeter, 30, 3)
     if DEBUG:
         print("L1-Active Power:", L1ActivePower, " kW")
 
-    L2ActivePower= read_float(smartmeter, 32, 3)
+    L2ActivePower = read_float(smartmeter, 32, 3)
     if DEBUG:
         print("L2-Active Power:", L2ActivePower, " kW")
 
-    L3ActivePower= read_float(smartmeter, 34, 3)
+    L3ActivePower = read_float(smartmeter, 34, 3)
     if DEBUG:
         print("L3-Active Power:", L3ActivePower, " kW")
 
+    # --- Reactive power (reg 36-42), unit kVar ---
     TotalReactivePower = read_float(smartmeter, 36, 3)
     if DEBUG:
         print("Total Reactive Power:", TotalReactivePower, " kVar")
@@ -285,6 +390,7 @@ def read_from_meter(meternr):
     if DEBUG:
         print("L3-Reactive Power:", L3ReactivePower, " kVar")
 
+    # --- Apparent power (reg 44-50), unit kVA ---
     TotalApparentPower = read_float(smartmeter, 44, 3)
     if DEBUG:
         print("Total Apparent Power:", TotalApparentPower, " kVA")
@@ -301,6 +407,7 @@ def read_from_meter(meternr):
     if DEBUG:
         print("L3-Apparent Power:", L3ApparentPower, " kVA")
 
+    # --- Power factors (reg 52-58), dimensionless ---
     TotalPowerFactor = read_float(smartmeter, 52, 2)
     if DEBUG:
         print("Total Power Faktor:", TotalPowerFactor)
@@ -322,7 +429,7 @@ def read_from_meter(meternr):
     #if DEBUG:
     #    print("Time: ",Time)
 
-    CRC = read_reg(smartmeter, 65)
+    CRC = read_reg(smartmeter, 65)            # Internal CRC / checksum register
     if DEBUG:
         print("CRC: ",CRC)
 
@@ -330,23 +437,24 @@ def read_from_meter(meternr):
     #if DEBUG:
     #    print("Combined Code: ",CombinedCode)
 
-    TotalActiveEnergy = read_float(smartmeter, 256, 2)
+    # --- Energy counters (reg 256+), unit kWh / kVarh ---
+    TotalActiveEnergy = read_float(smartmeter, 256, 2)      # Total (import+export) active energy
     if DEBUG:
         print("Total Active Energy:", TotalActiveEnergy, " kWh")
 
-    L1TotalActiveEnergy = read_float(smartmeter, 258, 2)
+    L1TotalActiveEnergy = read_float(smartmeter, 258, 2)     # Phase 1
     if DEBUG:
         print("L1 Total Active Energy:", L1TotalActiveEnergy, " kWh")
 
-    L2TotalActiveEnergy = read_float(smartmeter, 260, 2)
+    L2TotalActiveEnergy = read_float(smartmeter, 260, 2)     # Phase 2
     if DEBUG:
         print("L2 Total Active Energy:", L2TotalActiveEnergy, " kWh")
 
-    L3TotalActiveEnergy = read_float(smartmeter, 262, 2)
+    L3TotalActiveEnergy = read_float(smartmeter, 262, 2)     # Phase 3
     if DEBUG:
         print("L3 Total Active Energy:", L3TotalActiveEnergy, " kWh")
 
-    ForwardActiveEnergy = read_float(smartmeter, 264, 2)
+    ForwardActiveEnergy = read_float(smartmeter, 264, 2)     # Import (consumed) active energy
     if DEBUG:
         print("Forward Active Energy:", ForwardActiveEnergy, " kWh")
 
@@ -362,7 +470,7 @@ def read_from_meter(meternr):
     if DEBUG:
         print("L3 Forward Active Energy:", L3ForwardActiveEnergy, " kWh")
 
-    ReverseActiveEnergy = read_float(smartmeter, 272, 2)
+    ReverseActiveEnergy = read_float(smartmeter, 272, 2)    # Export (fed-in) active energy
     if DEBUG:
         print("Reverse Active Energy:", ReverseActiveEnergy, " kWh")
 
@@ -378,7 +486,7 @@ def read_from_meter(meternr):
     if DEBUG:
         print("L3 Reverse Active Energy:", L3ReverseActiveEnergy, " kWh")
 
-    TotalReactiveEnergy = read_float(smartmeter, 280, 2)
+    TotalReactiveEnergy = read_float(smartmeter, 280, 2)    # Total reactive energy
     if DEBUG:
         print("Total Reactive Energy:", TotalReactiveEnergy, " kVarh")
 
@@ -394,7 +502,7 @@ def read_from_meter(meternr):
     if DEBUG:
         print("L3 Reactive Energy:", L3TotalReactiveEnergy, " kVarh")
 
-    ForwardReactiveEnergy = read_float(smartmeter, 288, 2)
+    ForwardReactiveEnergy = read_float(smartmeter, 288, 2)  # Import reactive energy
     if DEBUG:
         print("Forward Reactive Energy:", ForwardReactiveEnergy, " kVarh")
 
@@ -410,7 +518,7 @@ def read_from_meter(meternr):
     if DEBUG:
         print("L3 Forward Reactive Energy:", L3ForwardReactiveEnergy, " kVarh")
 
-    ReverseReactiveEnergy = read_float(smartmeter, 296, 2)
+    ReverseReactiveEnergy = read_float(smartmeter, 296, 2)  # Export reactive energy
     if DEBUG:
         print("Reverse Reactive Energy:", ReverseReactiveEnergy, " kVarh")
 
@@ -426,29 +534,66 @@ def read_from_meter(meternr):
     if DEBUG:
         print("L3 Reverse Reactive Energy:", L3ReverseReactiveEnergy, " kVarh")
 
-    smartmeter.close()
+    try:
+        meter_data = {
+            "L1-Voltage (V)": L1Voltage,
+            "L2-Voltage (V)": L2Voltage,
+            "L3-Voltage (V)": L3Voltage,
+            "Grid Frequency (Hz)": Frequency,
+            "L1-Current (A)": L1Current,
+            "L2-Current (A)": L2Current,
+            "L3-Current (A)": L3Current,
+            "Total Active Power (kW)": TotalActivePower,
+            "L1-Active Power (kW)": L1ActivePower,
+            "L2-Active Power (kW)": L2ActivePower,
+            "L3-Active Power (kW)": L3ActivePower,
+            "Total Reactive Power (kVar)": TotalReactivePower,
+            "L1-Reactive Power (kVar)": L1ReactivePower,
+            "L2-Reactive Power (kVar)": L2ReactivePower,
+            "L3-Reactive Power (kVar)": L3ReactivePower,
+            "Total Apparent Power (kVA)": TotalApparentPower,
+            "L1-Apparent Power (kVA)": L1ApparentPower,
+            "L2-Apparent Power (kVA)": L2ApparentPower,
+            "L3-Apparent Power (kVA)": L3ApparentPower,
+            "Total Power Faktor": TotalPowerFactor,
+            "L1-Power Factor": L1PowerFactor,
+            "L2-Power Factor": L2PowerFactor,
+            "L3-Power Factor": L3PowerFactor,
+        }
+        if DEBUG:
+            print("MQTT Data-Object:", meter_data)
+        return meter_data
+    finally:
+        smartmeter.close()
 
-    hmdata = ('%(L1V).1f,%(L2V).1f,%(L3V).1f,%(f).2f,%(L1I).2f,%(L2I).2f,%(L3I).2f,'
-              '%(TAP)d,%(L1AP)d,%(L2AP)d,%(L3AP)d,'
-              '%(TRP)d,%(L1RP)d,%(L2RP)d,%(L3RP)d,'
-              '%(TSP)d,%(L1SP)d,%(L2SP)d,%(L3SP)d,'
-              '%(TPF).2f,%(L1PF).2f,%(L2PF).2f,%(L3PF).2f') % \
-        {"L1V": L1Voltage, "L2V": L2Voltage, "L3V": L3Voltage,
-         "f": Frequency,
-         "L1I": L1Current,"L2I": L2Current,"L3I": L3Current,
-         "TAP": TotalActivePower*1000,
-         "L1AP": L1ActivePower*1000, "L2AP": L2ActivePower*1000, "L3AP": L3ActivePower*1000,
-         "TRP": TotalReactivePower*1000,
-         "L1RP": L1ReactivePower*1000, "L2RP": L2ReactivePower*1000, "L3RP": L3ReactivePower*1000,
-         "TSP": TotalApparentPower*1000,
-         "L1SP": L1ApparentPower*1000, "L2SP": L2ApparentPower*1000, "L3SP": L3ApparentPower*1000,
-         "TPF": TotalPowerFactor,
-         "L1PF": L1PowerFactor, "L2PF": L2PowerFactor, "L3PF": L3PowerFactor}
-    if DEBUG:
-        print("HM Data-String:",hmdata)
-    return hmdata
+def main():
+    """Connect to MQTT, optionally bootstrap states, then read and publish data from all meters."""
+    # Connect to the MQTT broker with credentials from mqtt_credentials.py.
+    mqtt_client = mqtt.Client(callback_api_version=mqtt.CallbackAPIVersion.VERSION2)
+    mqtt_client.username_pw_set(MQTT_USERNAME, MQTT_PASSWORD)
+    mqtt_client.connect(MQTT_HOST, MQTT_PORT, keepalive=60)
+    mqtt_client.loop_start()  # background thread handles MQTT network traffic
 
-hmstring=read_from_meter(1)
-write_to_homematic(1, hmstring)
-hmstring=read_from_meter(2)
-write_to_homematic(2, hmstring)
+    try:
+        # When BOOTSTRAP_STATES is True, publish zero-value defaults for all
+        # states first so the ioBroker MQTT adapter creates the full object
+        # tree. Set BOOTSTRAP_STATES = False after the first successful run.
+        if BOOTSTRAP_STATES:
+            bootstrap_mqtt_states(1, mqtt_client)
+            bootstrap_mqtt_states(2, mqtt_client)
+
+        # Read live data from meter 1 (Household) and publish it.
+        meter_data = read_from_meter(1)
+        write_to_iobroker(1, meter_data, mqtt_client)
+
+        # Read live data from meter 2 (Heatpump) and publish it.
+        meter_data = read_from_meter(2)
+        write_to_iobroker(2, meter_data, mqtt_client)
+    finally:
+        # Always disconnect cleanly so the broker knows the client has gone.
+        mqtt_client.loop_stop()
+        mqtt_client.disconnect()
+
+
+if __name__ == "__main__":
+    main()
