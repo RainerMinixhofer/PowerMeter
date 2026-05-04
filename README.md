@@ -43,30 +43,32 @@ To run this python script successfully, create a Python virtual environment in t
 >
 > python3 -m venv .venv
 >
-> .venv/bin/pip install pymodbus paho-mqtt pyserial
+> .venv/bin/pip install pymodbus pyserial
 
 The `.venv` folder is excluded from git via `.gitignore`.
 
-MQTT broker settings are configured in `mqtt_credentials.py` (not tracked by git).
+ioBroker connection settings are configured in `iobroker_credentials.py` (not tracked by git).
 
 Create this local file from the provided template:
 
-> cp mqtt_credentials.template.py mqtt_credentials.py
+> cp iobroker_credentials.template.py iobroker_credentials.py
 
-Then edit `mqtt_credentials.py` and set:
+Then edit `iobroker_credentials.py` and set:
 
-- MQTT_USERNAME
-- MQTT_PASSWORD
-- MQTT_HOST — hostname or IP address of your MQTT broker
+- `IOBROKER_HOST` — hostname or IP address of your ioBroker server
+- `IOBROKER_REST_PORT` — port of the **rest-api** adapter (default: 8093, requires authentication)
+- `IOBROKER_SIMPLE_API_PORT` — port of the **simple-api** adapter (default: 8087)
+- `IOBROKER_USERNAME` — ioBroker user (Admin → Users)
+- `IOBROKER_PASSWORD` — password for that user
 
-The file `mqtt_credentials.py` is ignored by git via `.gitignore`.
+The file `iobroker_credentials.py` is ignored by git via `.gitignore`.
 
-Published topics follow this format (meter names are configured in `METER_TOPICS` inside `read_or-we-517.py`):
+The script writes meter readings as ioBroker states. The state root and meter sub-trees are configured via `IOBROKER_STATE_ROOT` and `METER_TOPICS` inside `read_or-we-517.py`. With the default configuration, states are created under:
 
-- powermeter/Household/\<metric\>
-- powermeter/Heatpump/\<metric\>
-- powermeter/Household/json
-- powermeter/Heatpump/json
+- `0_userdata.0.powermeter.Household.<metric>`
+- `0_userdata.0.powermeter.Heatpump.<metric>`
+
+State objects (type, unit, role) are created or updated automatically via the rest-api adapter on each run. Values are written via the simple-api adapter.
 
 ## Run script as service
 

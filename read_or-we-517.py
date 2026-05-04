@@ -4,67 +4,65 @@ Routine for reading Modbus registers from Orno OR-WE-517 Energy Meter
 """
 
 import struct                             # for IEEE 754 float conversion
-import json                              # for JSON MQTT payload
-import paho.mqtt.client as mqtt          # MQTT client
+import json
+import urllib.parse
+import urllib.request
+import base64
 from pymodbus.client import ModbusSerialClient  # RS-485/Modbus over serial
+from pymodbus.exceptions import ModbusException
 
 try:
-    from mqtt_credentials import MQTT_USERNAME, MQTT_PASSWORD, MQTT_HOST
+    from iobroker_credentials import (
+        IOBROKER_HOST,
+        IOBROKER_REST_PORT,
+        IOBROKER_SIMPLE_API_PORT,
+        IOBROKER_USERNAME,
+        IOBROKER_PASSWORD,
+    )
 except ImportError as exc:
     raise RuntimeError(
-        "Missing mqtt_credentials.py. Copy mqtt_credentials.template.py to "
-        "mqtt_credentials.py and set your MQTT credentials."
+        "Missing iobroker_credentials.py. Copy iobroker_credentials.template.py to "
+        "iobroker_credentials.py and set IOBROKER_HOST, IOBROKER_USERNAME and IOBROKER_PASSWORD."
     ) from exc
 
 # Set DEBUG = True to print every register value to stdout during a run.
 DEBUG = False
 
-# Set BOOTSTRAP_STATES = True for a single run to publish default (zero) values
-# for all states so the ioBroker MQTT adapter auto-creates the object tree.
-# Switch back to False for normal operation to avoid publishing spurious zeros.
-BOOTSTRAP_STATES = False
-
-# --- MQTT broker connection settings ---
-# MQTT_HOST is loaded from mqtt_credentials.py (not tracked by git).
-MQTT_PORT = 1883
-MQTT_TOPIC_PREFIX = "powermeter"  # root of all published topics
-MQTT_QOS = 1       # at-least-once delivery
-MQTT_RETAIN = True  # broker retains last value so ioBroker sees it after restart
+# ioBroker state root where this script creates objects/states.
+IOBROKER_STATE_ROOT = "0_userdata.0.powermeter"
 SAMPLE_TIME = 300   # intended polling interval in seconds (used externally, e.g. cron/systemd)
 
-# Maps Modbus device address -> MQTT sub-topic name.
+# Maps Modbus device address -> ioBroker device sub-tree name.
 # Add further meters here if needed.
 METER_TOPICS = {
     1: "Household",
     2: "Heatpump",
 }
 
-# Default payload used by bootstrap_mqtt_states() to seed the ioBroker object tree.
-# All values are zero; keys match exactly the keys published during normal operation.
-DEFAULT_METER_DATA = {
-    "L1-Voltage (V)": 0,
-    "L2-Voltage (V)": 0,
-    "L3-Voltage (V)": 0,
-    "Grid Frequency (Hz)": 0,
-    "L1-Current (A)": 0,
-    "L2-Current (A)": 0,
-    "L3-Current (A)": 0,
-    "Total Active Power (kW)": 0,
-    "L1-Active Power (kW)": 0,
-    "L2-Active Power (kW)": 0,
-    "L3-Active Power (kW)": 0,
-    "Total Reactive Power (kVar)": 0,
-    "L1-Reactive Power (kVar)": 0,
-    "L2-Reactive Power (kVar)": 0,
-    "L3-Reactive Power (kVar)": 0,
-    "Total Apparent Power (kVA)": 0,
-    "L1-Apparent Power (kVA)": 0,
-    "L2-Apparent Power (kVA)": 0,
-    "L3-Apparent Power (kVA)": 0,
-    "Total Power Faktor": 0,
-    "L1-Power Factor": 0,
-    "L2-Power Factor": 0,
-    "L3-Power Factor": 0,
+METRIC_META = {
+    "L1-Voltage": {"unit": "V", "role": "value.voltage"},
+    "L2-Voltage": {"unit": "V", "role": "value.voltage"},
+    "L3-Voltage": {"unit": "V", "role": "value.voltage"},
+    "Grid Frequency": {"unit": "Hz", "role": "value.frequency"},
+    "L1-Current": {"unit": "A", "role": "value.current"},
+    "L2-Current": {"unit": "A", "role": "value.current"},
+    "L3-Current": {"unit": "A", "role": "value.current"},
+    "Total Active Power": {"unit": "kW", "role": "value.power"},
+    "L1-Active Power": {"unit": "kW", "role": "value.power"},
+    "L2-Active Power": {"unit": "kW", "role": "value.power"},
+    "L3-Active Power": {"unit": "kW", "role": "value.power"},
+    "Total Reactive Power": {"unit": "kVar", "role": "value"},
+    "L1-Reactive Power": {"unit": "kVar", "role": "value"},
+    "L2-Reactive Power": {"unit": "kVar", "role": "value"},
+    "L3-Reactive Power": {"unit": "kVar", "role": "value"},
+    "Total Apparent Power": {"unit": "kVA", "role": "value"},
+    "L1-Apparent Power": {"unit": "kVA", "role": "value"},
+    "L2-Apparent Power": {"unit": "kVA", "role": "value"},
+    "L3-Apparent Power": {"unit": "kVA", "role": "value"},
+    "Total Power Faktor": {"unit": "", "role": "value"},
+    "L1-Power Factor": {"unit": "", "role": "value"},
+    "L2-Power Factor": {"unit": "", "role": "value"},
+    "L3-Power Factor": {"unit": "", "role": "value"},
 }
 
 
@@ -111,59 +109,68 @@ def umwandeln_ieee(Wert):  #Umwandlung Array of int ( 4 byte) in float nach IEEE
     """
     return struct.unpack('>f', struct.pack('>I', Wert))[0]
 
-def write_to_iobroker(meternr, meter_data, mqtt_client):
-    """
-    Writes measurement data from meternr into ioBroker via MQTT.
+def _rest_request(path: str, method: str = "GET", body=None) -> dict:
+    """Send a request to the ioBroker rest-api adapter (authenticated)."""
 
-    Parameters
-    ----------
-    meternr : Integer
-        Modbus number of meter to be read
-    meter_data : Dict
-        Dictionary with measurement values
-    mqtt_client : mqtt.Client
-        Connected MQTT client instance
+    url = f"http://{IOBROKER_HOST}:{IOBROKER_REST_PORT}{path}"
+    data = json.dumps(body).encode() if body is not None else None
+    creds = base64.b64encode(f"{IOBROKER_USERNAME}:{IOBROKER_PASSWORD}".encode()).decode()
+    headers = {
+        "Content-Type": "application/json",
+        "Authorization": f"Basic {creds}",
+    }
+    req = urllib.request.Request(url, data=data, headers=headers, method=method)
+    with urllib.request.urlopen(req) as resp:
+        return json.loads(resp.read().decode())
 
-    Returns
-    -------
-    None.
 
-    """
-    # Resolve the friendly topic name for this meter (e.g. "Household").
-    # Falls back to "meter<N>" for any unknown meter number.
-    meter_topic = METER_TOPICS.get(meternr, f"meter{meternr}")
-    topic_base = f"{MQTT_TOPIC_PREFIX}/{meter_topic}"
-
-    # Publish each metric as its own retained topic so ioBroker can map
-    # individual states, e.g. powermeter/Household/L1-Voltage (V)
-    for key, value in meter_data.items():
-        topic = f"{topic_base}/{key}"
-        mqtt_client.publish(topic, payload=str(value), qos=MQTT_QOS, retain=MQTT_RETAIN)
-
-    # Also publish a compact JSON payload for consumers that prefer one message.
-    mqtt_client.publish(
-        f"{topic_base}/json",
-        payload=json.dumps(meter_data),
-        qos=MQTT_QOS,
-        retain=MQTT_RETAIN,
+def _simple_set(state_id: str, value, ack: bool = True) -> dict:
+    """Write a state value via ioBroker simple-api adapter."""
+    ack_str = "true" if ack else "false"
+    encoded_id = urllib.parse.quote(state_id, safe="")
+    encoded_value = urllib.parse.quote(str(value), safe="")
+    url = (
+        f"http://{IOBROKER_HOST}:{IOBROKER_SIMPLE_API_PORT}"
+        f"/set/{encoded_id}?value={encoded_value}&ack={ack_str}"
     )
+    req = urllib.request.Request(url)
+    with urllib.request.urlopen(req) as resp:
+        return json.loads(resp.read().decode())
+
+
+def _metric_state_id(meter_topic: str, metric_name: str) -> str:
+    sanitized = metric_name.lower().replace(" ", "_").replace("-", "_")
+    return f"{IOBROKER_STATE_ROOT}.{meter_topic}.{sanitized}"
+
+
+def write_to_iobroker(meternr, meter_data):
+    """Create/update state objects via rest-api and write values via simple-api."""
+    meter_topic = METER_TOPICS.get(meternr, f"meter{meternr}")
+
+    for metric_name, value in meter_data.items():
+        metric_info = METRIC_META.get(metric_name, {"unit": "", "role": "value"})
+        state_id = _metric_state_id(meter_topic, metric_name)
+
+        obj = {
+            "type": "state",
+            "common": {
+                "name": metric_name,
+                "desc": "Created by OR-WE-517 reader",
+                "role": metric_info["role"],
+                "type": "number",
+                "unit": metric_info["unit"],
+                "read": True,
+                "write": True,
+                "def": 0,
+            },
+            "native": {},
+        }
+
+        _rest_request(f"/v1/object/{state_id}", method="PUT", body=obj)
+        _simple_set(state_id, value)
 
     if DEBUG:
-        print(f"Data written to ioBroker via MQTT topic base: {topic_base}")
-
-
-def bootstrap_mqtt_states(meternr, mqtt_client):
-    """
-    Publish default retained states so ioBroker MQTT adapter can auto-create
-    all expected objects in the MQTT tree.
-
-    Only call this when BOOTSTRAP_STATES is True (once, to seed the tree).
-    Calling it on every run would publish zeros before each real read and
-    cause values in ioBroker to flip between 0 and the measured value.
-    """
-    if DEBUG:
-        print(f"Bootstrapping MQTT states for meter {meternr}...")
-    write_to_iobroker(meternr, DEFAULT_METER_DATA, mqtt_client)
+        print(f"Data written to ioBroker state root: {IOBROKER_STATE_ROOT}.{meter_topic}")
 
 def read_reg(smartmeter, reg):
     """
@@ -189,7 +196,7 @@ def read_reg(smartmeter, reg):
             print("Read error reading register ", reg, "retry in next time interval")
             return 0
         return result.registers[0]
-    except Exception as e:
+    except (ModbusException, OSError) as e:
         print("Read error reading register ", reg, e, "retry in next time interval")
         return 0
 
@@ -218,7 +225,7 @@ def read_long(smartmeter, reg):
             return 0
         # Combine two 16-bit registers into a 32-bit integer (big-endian)
         return (result.registers[0] << 16) + result.registers[1]
-    except Exception as e:
+    except (ModbusException, OSError) as e:
         print("Read error reading register ", reg, e, "retry in next time interval")
         return 0
 
@@ -251,7 +258,7 @@ def read_float(smartmeter, reg, fractdig):
         # Combine two 16-bit registers into a 32-bit int, then convert to float
         value = (result.registers[0] << 16) + result.registers[1]
         return round(umwandeln_ieee(value), fractdig)
-    except Exception as e:
+    except (ModbusException, OSError) as e:
         print("Read error reading register ", reg, e, "retry in next time interval")
         return 0
 
@@ -263,7 +270,7 @@ def read_from_meter(meternr):
         after the instrument has been accessed (faster).
     meternr specifies the Modbus # of the meter
 
-    The routine returns a dictionary with values to be published via MQTT.
+    The routine returns a dictionary with values to be written to ioBroker.
     """
 
 
@@ -536,63 +543,43 @@ def read_from_meter(meternr):
 
     try:
         meter_data = {
-            "L1-Voltage (V)": L1Voltage,
-            "L2-Voltage (V)": L2Voltage,
-            "L3-Voltage (V)": L3Voltage,
-            "Grid Frequency (Hz)": Frequency,
-            "L1-Current (A)": L1Current,
-            "L2-Current (A)": L2Current,
-            "L3-Current (A)": L3Current,
-            "Total Active Power (kW)": TotalActivePower,
-            "L1-Active Power (kW)": L1ActivePower,
-            "L2-Active Power (kW)": L2ActivePower,
-            "L3-Active Power (kW)": L3ActivePower,
-            "Total Reactive Power (kVar)": TotalReactivePower,
-            "L1-Reactive Power (kVar)": L1ReactivePower,
-            "L2-Reactive Power (kVar)": L2ReactivePower,
-            "L3-Reactive Power (kVar)": L3ReactivePower,
-            "Total Apparent Power (kVA)": TotalApparentPower,
-            "L1-Apparent Power (kVA)": L1ApparentPower,
-            "L2-Apparent Power (kVA)": L2ApparentPower,
-            "L3-Apparent Power (kVA)": L3ApparentPower,
+            "L1-Voltage": L1Voltage,
+            "L2-Voltage": L2Voltage,
+            "L3-Voltage": L3Voltage,
+            "Grid Frequency": Frequency,
+            "L1-Current": L1Current,
+            "L2-Current": L2Current,
+            "L3-Current": L3Current,
+            "Total Active Power": TotalActivePower,
+            "L1-Active Power": L1ActivePower,
+            "L2-Active Power": L2ActivePower,
+            "L3-Active Power": L3ActivePower,
+            "Total Reactive Power": TotalReactivePower,
+            "L1-Reactive Power": L1ReactivePower,
+            "L2-Reactive Power": L2ReactivePower,
+            "L3-Reactive Power": L3ReactivePower,
+            "Total Apparent Power": TotalApparentPower,
+            "L1-Apparent Power": L1ApparentPower,
+            "L2-Apparent Power": L2ApparentPower,
+            "L3-Apparent Power": L3ApparentPower,
             "Total Power Faktor": TotalPowerFactor,
             "L1-Power Factor": L1PowerFactor,
             "L2-Power Factor": L2PowerFactor,
             "L3-Power Factor": L3PowerFactor,
         }
         if DEBUG:
-            print("MQTT Data-Object:", meter_data)
+            print("State Data-Object:", meter_data)
         return meter_data
     finally:
         smartmeter.close()
 
 def main():
-    """Connect to MQTT, optionally bootstrap states, then read and publish data from all meters."""
-    # Connect to the MQTT broker with credentials from mqtt_credentials.py.
-    mqtt_client = mqtt.Client(callback_api_version=mqtt.CallbackAPIVersion.VERSION2)
-    mqtt_client.username_pw_set(MQTT_USERNAME, MQTT_PASSWORD)
-    mqtt_client.connect(MQTT_HOST, MQTT_PORT, keepalive=60)
-    mqtt_client.loop_start()  # background thread handles MQTT network traffic
+    """Read all configured meters and write values into ioBroker states."""
+    meter_data = read_from_meter(1)
+    write_to_iobroker(1, meter_data)
 
-    try:
-        # When BOOTSTRAP_STATES is True, publish zero-value defaults for all
-        # states first so the ioBroker MQTT adapter creates the full object
-        # tree. Set BOOTSTRAP_STATES = False after the first successful run.
-        if BOOTSTRAP_STATES:
-            bootstrap_mqtt_states(1, mqtt_client)
-            bootstrap_mqtt_states(2, mqtt_client)
-
-        # Read live data from meter 1 (Household) and publish it.
-        meter_data = read_from_meter(1)
-        write_to_iobroker(1, meter_data, mqtt_client)
-
-        # Read live data from meter 2 (Heatpump) and publish it.
-        meter_data = read_from_meter(2)
-        write_to_iobroker(2, meter_data, mqtt_client)
-    finally:
-        # Always disconnect cleanly so the broker knows the client has gone.
-        mqtt_client.loop_stop()
-        mqtt_client.disconnect()
+    meter_data = read_from_meter(2)
+    write_to_iobroker(2, meter_data)
 
 
 if __name__ == "__main__":
